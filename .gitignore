@@ -1,0 +1,20 @@
+token*.json
+credentials.json
+.env
+# .env 의 사본(백업·편집 중 파일)에는 같은 값이 그대로 들어 있습니다.
+# 예시 파일만 예외로 추적합니다.
+.env.*
+!.env.example
+out/
+
+# VIP 개인 주소 목록 — 제3자 데이터. 형식은 vip_local.example.py 참고.
+# 이 줄을 지우지 마세요. 정책이 아니라 이 줄이 유출을 막습니다.
+vip_local.py
+*.log
+__pycache__/
+
+venv/
+.DS_Store
+
+# 실행 실패 경보 — run-cron.sh 가 만들고 지우는 런타임 상태. 커밋 금지.
+ALERT.md

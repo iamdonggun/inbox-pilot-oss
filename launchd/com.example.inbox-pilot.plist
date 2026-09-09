@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  inbox-pilot 주기 실행 (30분).
+
+  이 파일은 ~/Library/LaunchAgents/com.example.inbox-pilot.plist 의 사본입니다.
+  기기 재설정 시 복구용으로 repo 에 둡니다. 설치:
+
+      cp launchd/com.example.inbox-pilot.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.inbox-pilot.plist
+
+  실제 로깅과 중복 실행 방지는 scripts/run-cron.sh 가 담당합니다. 여기의
+  StandardOutPath/StandardErrorPath 는 래퍼가 실행되기 *전에* 터지는 오류
+  (스크립트 없음, 실행 권한 없음 등)를 잡기 위한 안전망입니다.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.inbox-pilot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USER/workspace/inbox-pilot/scripts/run-cron.sh</string>
+    </array>
+
+    <!-- .env 로드 및 상대 경로 안정성을 위해 repo 루트에서 실행합니다. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/workspace/inbox-pilot</string>
+
+    <!-- 매시 0분/30분 (30분 주기).
+         StartInterval(1800) 을 쓰지 않는 이유: 상대 타이머라 벽시계 기준점이
+         없습니다. 한 번 스톨하면 재무장할 계기가 없어 그대로 멈춥니다.
+         실제로 2026-08-05 12:00 이후 14시간 동안 한 번도 뜨지 않았고,
+         그때 launchd 상태는 "pended nondemand spawn = interval" 이었습니다
+         — 실행을 빚진 걸 알면서도 끝내 안 띄운 상태입니다.
+         StartCalendarInterval 은 매 발화마다 벽시계에 다시 앵커되므로
+         한 슬롯을 놓쳐도 다음 0분/30분에 스스로 복구됩니다. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
+
+    <!-- 로그인 시 자동 실행하지 않습니다. 타이머만으로 충분하고,
+         부팅 직후 네트워크가 뜨기 전에 도는 것을 피합니다. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd 의 PATH 는 거의 비어 있습니다. 래퍼도 자체 설정하지만
+         래퍼 자신을 찾는 단계를 위해 여기서도 명시합니다. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/workspace/inbox-pilot/out/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/workspace/inbox-pilot/out/cron.log</string>
+</dict>
+</plist>
