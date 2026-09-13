@@ -457,6 +457,16 @@ tail -5 out/audit.jsonl           # 감사 로그 (분류 1건당 1줄)
 ./venv/bin/python stats.py        # 계정별·카테고리별 비용/건수 집계
 ```
 
+규칙을 고친 뒤에는 회귀 테스트를 돌립니다. 네트워크도 토큰도 필요 없습니다.
+
+```bash
+python tests/test_tier0.py     # 종료 코드 0 = 전부 통과
+```
+
+케이스는 §6 규칙표와 §4 버그 다섯 건에서 뽑았습니다. 규칙 기반 분류기는 예외를
+던지지 않고 틀리므로, "무엇을 잡을까"보다 **"무엇을 삼킬까"**를 고정해 두는 쪽에
+비중을 뒀습니다.
+
 `stats.py` 옵션:
 
 | 옵션 | 설명 |
@@ -943,3 +953,4 @@ health check)·다이제스트 렌더링은 동결 대상이 아닙니다. 판�
 | `.env.example` | `.env` 키 이름 예시 (값 없음, 커밋됨). 사본 `.env.*`는 `.gitignore` 대상 |
 | `OBSERVATIONS.md` | 동결 기간 관찰 기록 (**커밋됨** — `message_id`와 판정만, 주소·제목 금지. §7) |
 | `ALERT.md` | 실행 실패 시 `run-cron.sh`가 생성 (**커밋 안 됨** — `.gitignore`. 정상 실행 시 삭제) |
+| `tests/test_tier0.py` | Tier 0 규칙 회귀 테스트. 의존성·네트워크·토큰 없이 `python tests/test_tier0.py` |
