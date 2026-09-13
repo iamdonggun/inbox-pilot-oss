@@ -10,11 +10,15 @@
 
 import argparse
 import base64
+import json
+import random
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 import auth
 import config
@@ -98,6 +102,76 @@ def _extract_email(value: str) -> str:
     return match.group(0).lower() if match else ""
 
 
+
+# ── 쿼터 초과 / 일시 장애 재시도 ──────────────────────────────────────
+# Gmail API 는 분당 쿼터를 넘기면 403(rateLimitExceeded) 또는 429 를 줍니다.
+# 이 수집기는 한 번에 수백 건을 format="full"(건당 5 쿼터유닛)로 긁으므로,
+# 창을 넓히는 순간 정확히 여기서 걸립니다. 실측(2026-09-13): 기계가 9일간
+# 꺼져 있다 돌아와 --days 12 로 백필하다 첫 계정에서 403 이 떨어졌고,
+# 파이프라인이 예외를 던지고 죽었습니다. 계정을 나누고 150건으로 줄여도
+# 같았습니다.
+#
+# 재시도가 없으면 **기계가 하루 이상 꺼졌다 돌아왔을 때의 복구 경로가
+# 막힙니다.** README §5.5 는 바로 그 상황을 위해 창을 3일로 넓혀 뒀는데,
+# 정작 창을 더 넓혀야 하는 순간에 수집이 죽으면 그 마진은 무의미합니다.
+#
+# 쿼터는 분 단위로 리셋되므로 누적 대기가 1분을 넘도록 잡습니다.
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+RETRYABLE_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "quotaExceeded",
+    "backendError",
+    "internalError",
+}
+MAX_RETRIES = 7            # 1+2+4+…+64 ≈ 최대 127초
+BASE_BACKOFF_SEC = 1.0
+
+# 건별 get 사이 간격. 쿼터에 닿기 전에 속도를 낮추는 쪽이, 닿은 뒤 백오프로
+# 1분씩 기다리는 것보다 총 시간이 짧습니다.
+GET_PACING_SEC = 0.05
+
+
+def _error_reason(error: HttpError) -> str:
+    """Google 이 준 reason 문자열. 못 읽으면 빈 문자열."""
+    try:
+        payload = json.loads(error.content.decode("utf-8"))
+    except Exception:
+        return ""
+    errors = payload.get("error", {}).get("errors") or []
+    return errors[0].get("reason", "") if errors else ""
+
+
+def _execute(request, what: str):
+    """재시도 가능한 오류면 지수 백오프로 다시 걸고, 아니면 그대로 올립니다.
+
+    403 에는 두 가지가 섞여 있습니다 — 쿼터 초과(기다리면 풀림)와 권한 없음
+    (기다려도 영원히 안 풀림). reason 으로 가릅니다. 권한 문제를 재시도로
+    덮으면 scope 가 잘못된 상태를 2분 동안 조용히 기다리다 같은 자리에서
+    죽습니다. 조용한 실패를 하나 더 만드는 셈입니다.
+
+    재시도는 stdout 에 한 줄씩 남깁니다. cron 로그에 남아야 "그냥 느린 실행"과
+    "쿼터에 계속 걸리는 실행"이 사후에 구분됩니다.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return request.execute()
+        except HttpError as error:
+            status = getattr(error.resp, "status", None)
+            reason = _error_reason(error)
+            retryable = status in RETRYABLE_STATUSES or (
+                status == 403 and reason in RETRYABLE_REASONS
+            )
+            if not retryable or attempt == MAX_RETRIES:
+                raise
+            wait = BASE_BACKOFF_SEC * (2 ** attempt) + random.uniform(0, 0.5)
+            print(
+                f"  [RETRY {attempt + 1}/{MAX_RETRIES}] {what} — "
+                f"{status} {reason} · {wait:.1f}s 대기"
+            )
+            time.sleep(wait)
+
+
 def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> list[dict]:
     """최근 `days`일 메일을 정제된 dict 목록으로 반환합니다."""
     service = build_service(account)
@@ -106,7 +180,7 @@ def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> lis
     ids: list[str] = []
     page_token = None
     while len(ids) < max_messages:
-        response = (
+        response = _execute(
             service.users()
             .messages()
             .list(
@@ -115,8 +189,8 @@ def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> lis
                 maxResults=min(100, max_messages - len(ids)),
                 pageToken=page_token,
                 includeSpamTrash=False,
-            )
-            .execute()
+            ),
+            f"list {account['key']} ({len(ids)}건까지)",
         )
         ids.extend(m["id"] for m in response.get("messages", []))
         page_token = response.get("nextPageToken")
@@ -124,14 +198,14 @@ def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> lis
             break
 
     messages = []
-    for message_id in ids:
-        raw = (
-            service.users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute()
+    for index, message_id in enumerate(ids):
+        raw = _execute(
+            service.users().messages().get(userId="me", id=message_id, format="full"),
+            f"get {account['key']} {index + 1}/{len(ids)}",
         )
         messages.append(_normalize(account, raw))
+        if GET_PACING_SEC:
+            time.sleep(GET_PACING_SEC)
 
     return messages
 
