@@ -181,8 +181,94 @@ def _execute(request, what: str):
             time.sleep(wait)
 
 
-def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> list[dict]:
-    """최근 `days`일 메일을 정제된 dict 목록으로 반환합니다."""
+
+# ── 수집 캐시 ─────────────────────────────────────────────────────────
+# 이미 판정이 끝난 메일까지 매번 다시 GET 하고 있었습니다. 중복 분류 방지가
+# **API 호출 뒤에** 걸려 있어서, 버릴 메일에도 messages.get 20유닛을 씁니다.
+# 실측(2026-09-13): 129건을 받아 54건을 "이미 분류됨"으로 버렸습니다.
+# 30분 주기이므로 같은 메일 하나에 하루 48번 값을 치릅니다.
+#
+# 그렇다고 그냥 건너뛸 수는 없습니다. 다이제스트는 그날의 전체 그림이라
+# 재사용분도 제목·발신자가 필요합니다(main.classify_account 주석). 그래서
+# 한 번 받은 메일의 **정제 필드만** out/ 에 적어 두고, 판정이 이미 있는 id 는
+# 캐시에서 꺼냅니다. 캐시에 없으면 그냥 받습니다 — 캐시가 비거나 깨져도
+# 동작이 달라지지 않아야 하고, 무엇보다 메일이 조용히 다이제스트에서
+# 빠지는 일이 없어야 합니다.
+#
+# **본문 조각(body_snippet)은 캐시에 넣지 않습니다.** 하드룰이 본문을 남기지
+# 않는 쪽이고, 캐시에서 꺼내는 메일은 이미 판정이 끝나 본문을 볼 일이
+# 없습니다. 대신 그런 항목에는 from_cache 를 달아, 본문이 필요한 경로
+# (--force-tier1)가 빈 본문을 모르고 태우지 않게 합니다.
+#
+# labels·is_unread·gmail_categories 는 최초 수집 시점 값으로 굳습니다. 이
+# 값들을 읽는 것은 tier0 뿐이고 캐시 항목은 tier0 를 타지 않으므로 분류에
+# 영향이 없습니다. 다이제스트가 읽는 것은 subject·from_email·age_days 셋뿐입니다.
+CACHE_FILE = config.OUT_DIR / "message-cache.jsonl"
+
+
+def _load_cache() -> dict[tuple[str, str], dict]:
+    """out/message-cache.jsonl 을 (계정, message_id) → 정제 dict 로 읽습니다."""
+    if not CACHE_FILE.exists():
+        return {}
+
+    cache: dict[tuple[str, str], dict] = {}
+    broken = 0
+    with CACHE_FILE.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                cache[(item["account_email"], item["message_id"])] = item
+            except (json.JSONDecodeError, KeyError):
+                broken += 1
+    if broken:
+        # 조용히 넘기지 않습니다. 깨진 줄은 해당 메일을 다시 받게 만들 뿐이라
+        # 결과는 옳지만, 캐시가 계속 깨지고 있다면 그건 알아야 할 사실입니다.
+        print(f"  수집 캐시 {broken}줄을 읽지 못했습니다 — 그 메일은 API 로 받습니다")
+    return cache
+
+
+def _append_cache(messages: list[dict]) -> None:
+    """새로 받은 메일의 정제 필드를 캐시에 덧붙입니다(본문 조각 제외)."""
+    if not messages:
+        return
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with CACHE_FILE.open("a", encoding="utf-8") as handle:
+        for message in messages:
+            item = {k: v for k, v in message.items() if k != "body_snippet"}
+            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def _from_cache(item: dict) -> dict:
+    """캐시 항목을 이번 실행에서 쓸 모양으로 되돌립니다.
+
+    경과일은 다시 셉니다. age_days 는 수집 시점 계산값이라 그대로 두면
+    다이제스트의 "경과 2일"이 며칠 뒤에도 2일로 남습니다. date 는 변하지
+    않으므로 거기서 오늘 기준으로 다시 셉니다.
+    """
+    restored = {**item, "body_snippet": "", "from_cache": True}
+    try:
+        sent = datetime.fromisoformat(item["date"])
+    except (KeyError, ValueError):
+        return restored
+    restored["age_days"] = max(0, (datetime.now(timezone.utc) - sent).days)
+    return restored
+
+
+def fetch_messages(
+    account: dict,
+    days: int = 3,
+    max_messages: int = 500,
+    skip_ids: set[str] | None = None,
+) -> list[dict]:
+    """최근 `days`일 메일을 정제된 dict 목록으로 반환합니다.
+
+    `skip_ids` 는 이미 판정이 끝난 메일의 id 입니다. 캐시에 정제 필드가 있으면
+    API 를 부르지 않고 거기서 꺼냅니다(위 CACHE_FILE 주석). 캐시에 없으면
+    평소대로 받습니다.
+    """
     service = build_service(account)
     query = f"newer_than:{days}d"
 
@@ -206,15 +292,37 @@ def fetch_messages(account: dict, days: int = 3, max_messages: int = 500) -> lis
         if not page_token:
             break
 
-    messages = []
+    skip_ids = skip_ids or set()
+    cache = _load_cache() if skip_ids else {}
+
+    messages: list[dict] = []
+    fetched: list[dict] = []
     for index, message_id in enumerate(ids):
+        if message_id in skip_ids:
+            hit = cache.get((account["email"], message_id))
+            if hit is not None:
+                messages.append(_from_cache(hit))
+                continue
         raw = _execute(
             service.users().messages().get(userId="me", id=message_id, format="full"),
             f"get {account['key']} {index + 1}/{len(ids)}",
         )
-        messages.append(_normalize(account, raw))
+        message = _normalize(account, raw)
+        messages.append(message)
+        fetched.append(message)
         if GET_PACING_SEC:
             time.sleep(GET_PACING_SEC)
+
+    _append_cache(fetched)
+
+    # 아낀 쿼터를 매 실행 한 줄로 남깁니다. 캐시가 조용히 비면 이 줄이
+    # 사라지므로, 사라진 것 자체가 신호가 됩니다.
+    reused = len(messages) - len(fetched)
+    if reused:
+        print(
+            f"  API {len(fetched)}건({len(fetched) * 20} 유닛) / "
+            f"캐시 {reused}건({reused * 20} 유닛 절약)"
+        )
 
     return messages
 

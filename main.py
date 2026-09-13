@@ -95,12 +95,18 @@ def force_tier1(
     결과는 반환만 하고 실제 분류(results)에는 넣지 않습니다. 감사 로그에는
     test=true 로 남습니다 — 호출은 실제로 발생했고 비용도 실제이기 때문입니다.
     """
-    sample = messages[:limit]
+    # 캐시에서 꺼낸 메일은 본문이 없습니다(fetch.CACHE_FILE 주석). 빈 본문을
+    # 태우면 "Tier1 이 무엇을 보고 답했는지"가 검증이 아니라 착시가 됩니다.
+    usable = [m for m in messages if not m.get("from_cache")]
+    excluded = len(messages) - len(usable)
+    sample = usable[:limit]
     print(f"\n{'=' * 60}")
     print(f"■ Tier1 강제 실행 검증 (--force-tier1, {len(sample)}건)")
     print("  실제 분류에는 반영하지 않습니다. audit 에는 test=true 로 남습니다.")
+    if excluded:
+        print(f"  캐시에서 꺼낸 {excluded}건은 본문이 없어 제외했습니다.")
     if len(sample) < limit:
-        print(f"  참고: 수집된 메일이 {len(messages)}건이라 {len(sample)}건만 태웁니다.")
+        print(f"  참고: 태울 수 있는 메일이 {len(usable)}건이라 {len(sample)}건만 태웁니다.")
     print("=" * 60)
 
     records = []
@@ -248,8 +254,19 @@ def main() -> int:
     collected: list[dict] = []
     for account in accounts:
         print(f"\n[{account['email']}] 수집 중 (최근 {args.days}일)...")
+        # 이미 판정이 있는 id 는 fetch 단계에서 캐시로 대체합니다. 예전에는
+        # 전부 받아 온 뒤 classify_account 에서 버렸는데, 버릴 메일에도
+        # messages.get 20유닛을 썼습니다.
+        skip_ids = {
+            message_id
+            for (email, message_id) in classified
+            if email == account["email"]
+        }
         messages = fetch.fetch_messages(
-            account, days=args.days, max_messages=args.max_messages
+            account,
+            days=args.days,
+            max_messages=args.max_messages,
+            skip_ids=skip_ids,
         )
         print(f"[{account['email']}] {len(messages)}건 수집")
         collected.extend(messages)

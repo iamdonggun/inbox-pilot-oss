@@ -18,6 +18,9 @@ LOG="$REPO/out/cron.log"
 LOCK="$REPO/out/.cron.lock"
 ALERT="$REPO/ALERT.md"
 FAILS="$REPO/out/.consecutive-failures"
+# 이번 고장을 폰으로 **실제로 알리는 데 성공했는지** 표시하는 파일.
+# 연속 실패 횟수(FAILS)와 다릅니다 — 아래 escalate 주석 참고.
+NOTIFIED="$REPO/out/.alert-notified"
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 # 로케일이 없으면 파이썬 stdout 이 ASCII 로 잡혀 한글 출력에서 죽습니다.
@@ -53,8 +56,14 @@ notify() {
         echo "[$(ts)] 알림 건너뜀: 실행 가능한 파이썬 없음"
         return 0
     fi
-    "$py" "$REPO/notify.py" "$@" || echo "[$(ts)] 알림 전송 실패 — 파이프라인은 계속 진행합니다"
-    return 0
+    if "$py" "$REPO/notify.py" "$@"; then
+        return 0
+    fi
+    echo "[$(ts)] 알림 전송 실패 — 파이프라인은 계속 진행합니다"
+    # 파이프라인은 계속 갑니다(알림은 부수 효과). 다만 **성공했는지는
+    # 호출자에게 알려줍니다.** 예전에는 여기서도 return 0 이라, 보내지
+    # 못한 알림이 보낸 것으로 처리됐습니다.
+    return 1
 }
 
 # ── 실패 에스컬레이션 ─────────────────────────────────────────────────
@@ -140,16 +149,31 @@ PYEOF
     # 30분마다 같은 알림이 오면 사람이 알림을 끄고, 그러면 9일 침묵과 결과가
     # 같아집니다. 고장이 계속된다는 사실은 ALERT.md 의 연속 횟수가 들고
     # 있으므로 재전송으로 확인시킬 필요가 없습니다.
-    if [ "$count" -eq 1 ]; then
-        notify fail --rc "$rc" --reason "$reason" --count "$count" \
-            --first-fail "$first_fail" --at "$(ts)"
+    #
+    # ■ 전이 판정은 "몇 회차인가"가 아니라 "한 번이라도 전송에 성공했는가"
+    #   입니다. 2026-09-12 15:00:06 의 1회차 알림은 DNS 가 죽어 전송에
+    #   실패했는데, 횟수 기준이라 2회차부터 "이미 발송함"으로 침묵했습니다.
+    #   그 고장은 끝내 폰에 닿지 않았고, 다음 날 복구 알림만 도착했습니다 —
+    #   사람 입장에서는 고장난 줄도 모르는데 복구됐다는 연락만 온 것입니다.
+    #
+    #   알림 경로가 알림 대상과 같은 네트워크를 쓰는 한 첫 시도는 언제든
+    #   실패할 수 있습니다. 그래서 성공할 때까지 매 실행 다시 시도하고,
+    #   성공한 뒤에는 표식을 남겨 침묵합니다. 전송이 안 되는 동안은 어차피
+    #   폰에 아무것도 안 가므로 스팸이 되지 않습니다.
+    if [ "$count" -eq 1 ] || [ ! -f "$NOTIFIED" ]; then
+        if notify fail --rc "$rc" --reason "$reason" --count "$count" \
+            --first-fail "$first_fail" --at "$(ts)"; then
+            : >"$NOTIFIED"
+        else
+            echo "[$(ts)] 미전송 — 다음 실행에서 다시 시도합니다 (연속 ${count}회차)"
+        fi
     else
-        echo "[$(ts)] 알림 생략: 연속 ${count}회차 (전이 아님 — 1회차에 이미 발송)"
+        echo "[$(ts)] 알림 생략: 연속 ${count}회차 (전이 아님 — 이미 전송 성공)"
     fi
 }
 
 clear_alert() {
-    rm -f "$ALERT" "$FAILS"
+    rm -f "$ALERT" "$FAILS" "$NOTIFIED"
 }
 
 # 실패 → 정상 전이. 카운터 파일이 있을 때만, 즉 직전 실행이 실패했을 때만
